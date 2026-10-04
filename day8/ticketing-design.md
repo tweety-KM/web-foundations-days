@@ -379,3 +379,114 @@ All three statements succeed together or none of them does (a transaction), so a
 - **Hold length: more purchases vs locked seats.** A short hold (for example 5 minutes) frees seats quickly but pressures slow payers. A long hold lets people pay calmly but lets people who never buy block seats from others. Ten minutes is a compromise.
 - **One primary database: correctness vs scale.** Sending all seat writes to a single primary keeps the data consistent and simple, but it is one place that can become a bottleneck or fail. The waiting room limits the load on it, and a replica that can be promoted protects against failure. Splitting events across several databases would scale further but is much more complex.
 - **Over-provisioning: cost vs risk.** Starting extra servers before a sale costs money, but running out of capacity during a sale would cost far more in lost sales and trust.
+
+## Addendum: seats and holds schema with concurrency control
+
+This section refines the data model so that holds are their own table and seat reservations are protected by explicit concurrency control. The SQL is written for PostgreSQL, which supports row locks (`SELECT ... FOR UPDATE`).
+
+### Tables
+
+```sql
+CREATE TABLE holds (
+  id          BIGSERIAL PRIMARY KEY,
+  user_id     BIGINT NOT NULL REFERENCES users(id),
+  event_id    BIGINT NOT NULL REFERENCES events(id),
+  status      TEXT NOT NULL DEFAULT 'active'
+              CHECK (status IN ('active', 'converted', 'released', 'expired')),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at  TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE seats (
+  id           BIGSERIAL PRIMARY KEY,
+  event_id     BIGINT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+  section      TEXT NOT NULL,
+  row_label    TEXT NOT NULL,
+  seat_number  INTEGER NOT NULL,
+  price_cents  INTEGER NOT NULL CHECK (price_cents >= 0),
+  status       TEXT NOT NULL DEFAULT 'available'
+               CHECK (status IN ('available', 'held', 'sold')),
+  hold_id      BIGINT REFERENCES holds(id),
+  version      INTEGER NOT NULL DEFAULT 0,   -- increases on every change
+  UNIQUE (event_id, section, row_label, seat_number)
+);
+
+CREATE INDEX idx_seats_event_status ON seats (event_id, status);
+CREATE INDEX idx_holds_expiry ON holds (expires_at) WHERE status = 'active';
+```
+
+Each seat points to at most one hold through `seats.hold_id`, so a seat can never belong to two holds at once. The `version` column counts how many times a seat has changed, and it is used for optimistic locking.
+
+### Option A: pessimistic locking with SELECT FOR UPDATE
+
+The transaction locks the seat rows it wants. Anyone else asking for the same rows waits, and then sees their new state.
+
+```sql
+BEGIN;
+
+-- 1. Lock the requested seats. SKIP LOCKED makes other buyers skip seats
+--    that are being claimed right now instead of waiting in a queue.
+SELECT id, status, hold_id
+FROM seats
+WHERE id = ANY(:seat_ids) AND event_id = :event_id
+FOR UPDATE SKIP LOCKED;
+
+-- 2. If fewer rows came back than requested, or any seat is not free
+--    (status = 'held' with an unexpired hold, or 'sold'), ROLLBACK and return 409.
+
+-- 3. Create the hold and attach the seats to it.
+INSERT INTO holds (user_id, event_id, expires_at)
+VALUES (:user_id, :event_id, now() + interval '10 minutes')
+RETURNING id;
+
+UPDATE seats
+SET status = 'held', hold_id = :hold_id, version = version + 1
+WHERE id = ANY(:seat_ids);
+
+COMMIT;
+```
+
+Because the rows are locked from step 1 until `COMMIT`, two buyers can never both pass the "is it free?" check for the same seat.
+
+### Option B: optimistic locking with a version column
+
+No locks are held. Each seat is updated only if its version is still the one that was read, so if someone changed it in between, the update affects 0 rows.
+
+```sql
+-- The app first reads the seat: SELECT id, status, version FROM seats WHERE id = :seat_id;
+-- then tries to claim it, passing the version it saw:
+
+UPDATE seats
+SET status = 'held',
+    hold_id = :hold_id,
+    version = version + 1
+WHERE id = :seat_id
+  AND version = :version_seen        -- nobody has changed it since we read it
+  AND status = 'available';
+
+-- 1 row changed: we own the seat.
+-- 0 rows changed: someone else changed it first, so ROLLBACK and return 409.
+```
+
+### Which one to use
+
+For a big sale I would use **Option A with `SKIP LOCKED`**. Hundreds of people compete for the same good seats, so with optimistic locking most attempts would fail and retry, which wastes work. Locking makes each seat's winner decided in one short step. Option B is simpler and holds no locks, so it suits normal days with little competition.
+
+### Expiring holds
+
+A background worker frees seats from expired holds. The purchase transaction also checks `holds.expires_at` itself, so an expired hold can never be paid for even if the worker is late:
+
+```sql
+UPDATE seats
+SET status = 'available', hold_id = NULL, version = version + 1
+WHERE hold_id IN (
+  SELECT id FROM holds WHERE status = 'active' AND expires_at < now()
+);
+
+UPDATE holds SET status = 'expired'
+WHERE status = 'active' AND expires_at < now();
+```
+
+### Converting a hold into a purchase
+
+The `tickets.seat_id UNIQUE` constraint remains as the last line of defence. The purchase transaction locks the hold, checks that it is still active and unexpired, creates the order and tickets, marks the seats `sold`, and sets the hold to `converted`. All of this happens in one transaction.
