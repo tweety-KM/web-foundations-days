@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QuickNotes</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>QuickNotes</h1>
+    <p>Capture your ideas in seconds.</p>
+    <nav>
+      <a href="index.html">Home</a>
+      <a href="about.html">About</a>
+    </nav>
+  </header>
+
+  <main>
+    <h2>My Notes</h2>
+
+    <section>
+      <form id="note-form">
+        <label for="note-input">New note</label>
+        <input type="text" id="note-input" name="note" placeholder="Type a note...">
+        <button type="submit">Add note</button>
+      </form>
+    </section>
+
+    <section>
+      <p id="note-count"></p>
+      <ul id="notes-list"></ul>
+    </section>
+  </main>
+
+  <footer>
+    <p>&copy; 2026 QuickNotes</p>
+  </footer>
+</body>
+</html>
