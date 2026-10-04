@@ -54,55 +54,53 @@ Instead, photo files go in **object storage** (such as Amazon S3). It is cheap, 
 
 ## 5. Architecture diagram
 
-```text
-                          +-----------+
-                          |   Users   |
-                          | (phones,  |
-                          |  browsers)|
-                          +-----+-----+
-                                |
-                                v
-                          +-----------+
-                          |    CDN    |  <-- serves photos and thumbnails
-                          +-----+-----+      (cached close to users)
-                                |
-                                v
-                       +-----------------+
-                       |  Load balancer  |
-                       +--------+--------+
-                                |
-              +-----------------+-----------------+
-              |                 |                 |
-              v                 v                 v
-        +-----------+     +-----------+     +-----------+
-        | App server|     | App server|     | App server|
-        +-----+-----+     +-----+-----+     +-----+-----+
-              |                 |                 |
-              +--------+--------+--------+--------+
-                       |        |        |
-          reads        |        |        |  writes / uploads
-       +---------------+        |        +----------------+
-       |                        |                         |
-       v                        v                         v
-  +---------+          +------------------+       +----------------+
-  |  Cache  |          |     Database     |       | Object storage |
-  | (Redis) |          |  Primary (writes)|       |  (photo files: |
-  +---------+          |        |         |       |   originals +  |
-                       |        v         |       |   thumbnails)  |
-                       |  Read replica    |       +--------+-------+
-                       |    (reads)       |                ^
-                       +------------------+                |
-                                                           |
-              +--------------------+       +---------------+--+
-              | Queue              | ----> | Thumbnail worker |
-              | ("make thumbnail"  |       | (reads original, |
-              |  jobs)             |       |  saves 50 KB     |
-              +---------^----------+       |  thumbnail)      |
-                        |                  +------------------+
-                        |
-               (app server adds a job
-                after each upload)
-```
+                              +-----------+
+                              |   Users   |
+                              | (phones,  |
+                              |  browsers)|
+                              +-----+-----+
+                                    |
+                                    v
+                              +-----------+
+                              |    CDN    |  <-- serves photos and thumbnails
+                              +-----+-----+      (cached close to users)
+                                    |
+                                    v
+                           +-----------------+
+                           |  Load balancer  |
+                           +--------+--------+
+                                    |
+                  +-----------------+-----------------+
+                  |                 |                 |
+                  v                 v                 v
+            +-----------+     +-----------+     +-----------+
+            | App server|     | App server|     | App server|
+            +-----+-----+     +-----+-----+     +-----+-----+
+                  |                 |                 |
+                  +--------+--------+--------+--------+
+                           |        |        |
+              reads        |        |        |  writes / uploads
+           +---------------+        |        +----------------+
+           |                        |                         |
+           v                        v                         v
+      +---------+          +------------------+       +----------------+
+      |  Cache  |          |     Database     |       | Object storage |
+      | (Redis) |          |  Primary (writes)|       |  (photo files: |
+      +---------+          |        |         |       |   originals +  |
+                           |        v         |       |   thumbnails)  |
+                           |  Read replica    |       +--------+-------+
+                           |    (reads)       |                ^
+                           +------------------+                |
+                                                               |
+                  +--------------------+       +---------------+--+
+                  | Queue              | ----> | Thumbnail worker |
+                  | ("make thumbnail"  |       | (reads original, |
+                  |  jobs)             |       |  saves 50 KB     |
+                  +---------^----------+       |  thumbnail)      |
+                            |                  +------------------+
+                            |
+                   (app server adds a job
+                    after each upload)
 
 ## 6. What each component does
 
@@ -124,7 +122,7 @@ Instead, photo files go in **object storage** (such as Amazon S3). It is cheap, 
 4. The app server saves the original photo to **object storage** and gets back its file key.
 5. The app server writes a metadata row (user, caption, timestamp, file key, status "processing") to the **primary database**.
 6. The app server puts a "create thumbnail for photo X" job on the **queue**.
-7. The app server replies to the user straight away with "Upload successful", without waiting for the thumbnail.
+7. The app server replies to the user straight away with "Upload successful", without waiting for the thumbnail. The user's request is finished at this point, and the thumbnail is created later in the background.
 8. A **thumbnail worker** takes the job from the queue, downloads the original from object storage, resizes it to a 50 KB thumbnail and saves it back to object storage.
 9. The worker updates the database row to status "ready" and clears the relevant cache entries.
 10. Followers' feeds now show the new photo, with the thumbnail served by the **CDN**. If a worker fails, the job stays in the queue and is retried.
@@ -132,6 +130,6 @@ Instead, photo files go in **object storage** (such as Amazon S3). It is cheap, 
 ## 8. Trade-offs
 
 - **Caching vs freshness:** a cache and the CDN make feeds fast and cheap, but they can show slightly old data, for example a deleted photo that lingers for a short time. Shorter cache times are fresher but put more load on the database.
-- **Read replica vs consistency:** the replica takes read load off the primary, but it copies data a moment after the primary, so a user may upload a photo and briefly not see it in their own feed. We accept this small delay (eventual consistency) in return for scale.
+- **Read replica lag vs data freshness:** the replica takes read load off the primary, but it copies data a moment after the primary, so a user may upload a photo and briefly not see it in their own feed. We accept this small delay (eventual consistency) in return for scale, and can read a user's own recent uploads from the primary to hide it.
 - **Queue vs instant results:** the queue keeps uploads fast and lets thumbnails be retried, but the thumbnail appears a few seconds later, and we must run and monitor extra workers.
 - **Cost vs speed:** a CDN and object storage at about 750 TB a year are not cheap, but serving images from our own servers would cost more and be slower. We could reduce cost by moving old photos to cheaper storage tiers.
